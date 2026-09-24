@@ -47,7 +47,13 @@ from apps.manual_trading.signal_generator import generate_signal
 from apps.manual_trading.strategies.mean_reversion import MeanReversionEngine
 from apps.manual_trading.strategies.ai_analysis.engine import AIAnalysisEngine, AIAnalysisResult
 from apps.manual_trading.constants import COOLDOWN_BARS
+from apps.manual_trading.data_sufficiency_gate import DataSufficiencyGate
 from infrastructure.features.indicators.technical import TechnicalIndicators
+from apps.manual_trading.confidence_calibration import (
+    CalibrationStore,
+    ConfidenceCalibrator,
+)
+from apps.manual_trading.regime_classifier import RegimeReading
 
 logger = logging.getLogger(__name__)
 
@@ -154,7 +160,7 @@ async def callback_mode(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if not data.startswith("mode:"):
         return
 
-    mode = data.split(":", 1)[1]
+    mode = data.split(":")[1]
     pairs = await _get_filtered_pairs(context)
 
     if not pairs:
@@ -297,6 +303,19 @@ async def _handle_ai_duration(
             )
             return
 
+        # Data sufficiency gate — check quality, not just count
+        gate = DataSufficiencyGate()
+        tick_history = await collector.get_tick_history(symbol)
+        quality_report = gate.evaluate(df, timeframe_sec, tick_counts=tick_history)
+        if not quality_report.is_sufficient:
+            symbol_display = symbol.replace("_otc", " (OTC)").replace("_", "/")
+            await query.edit_message_text(
+                f"Not enough reliable data yet for {symbol_display}.\n"
+                f"{quality_report.summary()}\n"
+                f"Try again in a moment or pick a different pair."
+            )
+            return
+
         ti = TechnicalIndicators()
         df_with_indicators = ti.compute(df)
 
@@ -373,7 +392,7 @@ async def _handle_ai_duration(
             if ml_model.metadata and ml_model.metadata.version:
                 result_model_version = ml_model.metadata.version
 
-        # --- Build common snapshot (works for both AI and ML paths) ---
+        # Build common snapshot (works for both AI and ML paths)
         last_row = df_with_indicators.iloc[-1]
         result_indicators = {}
         for col in ["rsi", "adx", "macd_hist", "bb_pct", "stoch_k", "roc_5"]:
@@ -381,6 +400,29 @@ async def _handle_ai_duration(
                 val = last_row[col]
                 if pd.notna(val):
                     result_indicators[col] = float(val)
+
+        # Regime classification for the AI path (same as quick path)
+        from apps.manual_trading.regime_classifier import RegimeClassifier
+        regime = RegimeClassifier().classify(df_with_indicators)
+
+        # Multi-timeframe confirmation
+        htf_note: str | None = None
+        if timeframe_sec >= 60:
+            from apps.manual_trading.htf_confirmation import HTFConfirmation
+            htf = HTFConfirmation()
+            htf_result = htf.confirm(df_with_indicators, timeframe_sec)
+            if htf_result is not None:
+                if htf_result.confidence_penalty:
+                    regime = RegimeReading(
+                        regime=regime.regime,
+                        adx=regime.adx,
+                        bb_width=regime.bb_width,
+                        bb_width_percentile=regime.bb_width_percentile,
+                        trend_weight=max(0.5, regime.trend_weight * (1 - htf_result.confidence_penalty)),
+                        reversion_weight=max(0.5, regime.reversion_weight * (1 - htf_result.confidence_penalty)),
+                    )
+                if htf_result.note:
+                    htf_note = htf_result.note
 
         # --- Send signal message ---
         signal_msg = format_ai_signal(
@@ -416,6 +458,23 @@ async def _handle_ai_duration(
         expiry = now + timedelta(seconds=timeframe_sec)
         from uuid import uuid4
 
+        # Data quality metadata for calibration auditing
+        last_ts = df["timestamp"].iloc[-1]
+        now_ts = pd.Timestamp.now(timezone.utc)
+        if last_ts.tzinfo is None:
+            last_ts = last_ts.tz_localize("UTC")
+        data_age = (now_ts - last_ts).total_seconds()
+        candle_count = len(df)
+        issues_list = [i.value for i in quality_report.issues] if quality_report.issues else None
+
+        # Confidence calibration — remap raw ML/LLM confidence through reliability curve
+        store: PredictionStore = context.bot_data["prediction_store"]
+        if result_confidence > 0.50:
+            calibrator = ConfidenceCalibrator(
+                await CalibrationStore(store).build_curve()
+            )
+            result_confidence = calibrator.calibrate(result_confidence)
+
         prediction = Prediction(
             id=uuid4(),
             telegram_id=telegram_id,
@@ -433,6 +492,9 @@ async def _handle_ai_duration(
             entry_time=now,
             expiry_time=expiry,
             result=None,
+            candle_count=candle_count,
+            data_age_seconds=data_age,
+            data_sufficiency_issues=issues_list,
         )
 
         store: PredictionStore = context.bot_data["prediction_store"]
@@ -516,9 +578,50 @@ async def _handle_quick_duration(
             )
             return
 
+        # Data sufficiency gate — check quality, not just count
+        gate = DataSufficiencyGate()
+        tick_history = await collector.get_tick_history(symbol)
+        quality_report = gate.evaluate(df, timeframe_sec, tick_counts=tick_history)
+        if not quality_report.is_sufficient:
+            symbol_display = symbol.replace("_otc", " (OTC)").replace("_", "/")
+            issue_str = quality_report.summary()
+            logger.warning(
+                "data_sufficiency_failed symbol=%s report=%s",
+                symbol, issue_str,
+            )
+            await query.edit_message_text(
+                f"Not enough reliable data yet for {symbol_display}.\n"
+                f"{issue_str}\n"
+                f"Try again in a moment or pick a different pair."
+            )
+            return
+
         # Compute indicators
         ti = TechnicalIndicators()
         df_with_indicators = ti.compute(df)
+
+        # Regime classification
+        from apps.manual_trading.regime_classifier import RegimeClassifier
+        regime = RegimeClassifier().classify(df_with_indicators)
+
+        # Multi-timeframe confirmation (skip for 1-min — no higher TF available)
+        htf_note: str | None = None
+        if timeframe_sec >= 60:
+            from apps.manual_trading.htf_confirmation import HTFConfirmation
+            htf = HTFConfirmation()
+            htf_result = htf.confirm(df_with_indicators, timeframe_sec)
+            if htf_result is not None:
+                if htf_result.confidence_penalty:
+                    regime = regime.__class__(
+                        regime=regime.regime,
+                        adx=regime.adx,
+                        bb_width=regime.bb_width,
+                        bb_width_percentile=regime.bb_width_percentile,
+                        trend_weight=regime.trend_weight * (1 - htf_result.confidence_penalty),
+                        reversion_weight=regime.reversion_weight * (1 - htf_result.confidence_penalty),
+                    )
+                if htf_result.note:
+                    htf_note = htf_result.note
 
         # Cooldown check — block signals for the same pair within COOLDOWN_BARS
         cooldown_state: dict[str, int] = context.user_data.setdefault(
@@ -544,7 +647,7 @@ async def _handle_quick_duration(
             engine = MeanReversionEngine()
             signal = engine.generate_signal(df)
         else:
-            signal = generate_signal(df_with_indicators)
+            signal = generate_signal(df_with_indicators, regime=regime)
 
         # Gate: only proceed if signal is valid
         if not signal.has_signal:
@@ -585,6 +688,27 @@ async def _handle_quick_duration(
         expiry = now + timedelta(seconds=timeframe_sec)
         from uuid import uuid4
 
+        # Data quality metadata for calibration auditing
+        last_ts = df["timestamp"].iloc[-1]
+        now_ts = pd.Timestamp.now(timezone.utc)
+        if last_ts.tzinfo is None:
+            last_ts = last_ts.tz_localize("UTC")
+        data_age = (now_ts - last_ts).total_seconds()
+        candle_count = len(df)
+        issues_list = [i.value for i in quality_report.issues] if quality_report.issues else None
+
+        # Confidence calibration — remap raw vote-ratio through reliability curve
+        from apps.manual_trading.confidence_calibration import (
+            CalibrationStore,
+            ConfidenceCalibrator,
+        )
+        store: PredictionStore = context.bot_data["prediction_store"]
+        if signal.has_signal:
+            calibrator = ConfidenceCalibrator(
+                await CalibrationStore(store).build_curve()
+            )
+            signal.confidence = calibrator.calibrate(signal.confidence)
+
         prediction = Prediction(
             id=uuid4(),
             telegram_id=telegram_id,
@@ -598,6 +722,10 @@ async def _handle_quick_duration(
             entry_time=now,
             expiry_time=expiry,
             result=None,
+            candle_count=candle_count,
+            data_age_seconds=data_age,
+            data_sufficiency_issues=issues_list,
+            feature_snapshot=signal.indicators,
         )
 
         store: PredictionStore = context.bot_data["prediction_store"]

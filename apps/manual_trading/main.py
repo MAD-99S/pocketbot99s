@@ -29,6 +29,7 @@ from apps.manual_trading.bot import ManualTradingBot
 from apps.manual_trading.database import PredictionStore, TrainingDataStore, AISignalStore
 from apps.manual_trading.strategies.ai_analysis.engine import AIAnalysisEngine
 from apps.manual_trading.market_data import MarketDataCollector
+from apps.manual_trading.candle_store import CandleStore
 from apps.manual_trading.trade_tracker import TradeTracker
 from infrastructure.ml.model import TradingModel
 
@@ -144,12 +145,82 @@ async def main() -> None:
     except Exception:
         logger.warning("migration_ai_signals_failed", exc_info=True)
 
+    # Ensure candles table exists (idempotent migration)
+    try:
+        async with engine.connect() as conn:
+            await conn.execute(text(
+                """
+                CREATE TABLE IF NOT EXISTS candles (
+                    symbol TEXT NOT NULL,
+                    timeframe_sec INT NOT NULL,
+                    timestamp TIMESTAMPTZ NOT NULL,
+                    open DOUBLE PRECISION NOT NULL,
+                    high DOUBLE PRECISION NOT NULL,
+                    low DOUBLE PRECISION NOT NULL,
+                    close DOUBLE PRECISION NOT NULL,
+                    volume DOUBLE PRECISION NOT NULL DEFAULT 0,
+                    ticks_in_candle INT NOT NULL DEFAULT 0,
+                    created_at TIMESTAMPTZ DEFAULT NOW(),
+                    PRIMARY KEY (symbol, timeframe_sec, timestamp)
+                )
+                """
+            ))
+            await conn.execute(text(
+                "CREATE INDEX IF NOT EXISTS idx_candles_symbol_timeframe "
+                "ON candles (symbol, timeframe_sec, timestamp DESC)"
+            ))
+            await conn.commit()
+        logger.info("migration_candles_table_applied")
+    except Exception:
+        logger.warning("migration_candles_table_failed", exc_info=True)
+
+    # Ensure predictions.has_feature_snapshot column (idempotent migration)
+    try:
+        async with engine.connect() as conn:
+            await conn.execute(text(
+                "ALTER TABLE predictions ADD COLUMN IF NOT EXISTS feature_snapshot JSONB"
+            ))
+            await conn.commit()
+        logger.info("migration_feature_snapshot_column_applied")
+    except Exception:
+        logger.warning("migration_feature_snapshot_column_failed", exc_info=True)
+
+    # Ensure predictions has data-quality columns (idempotent migration)
+    for col_sql in [
+        "ALTER TABLE predictions ADD COLUMN IF NOT EXISTS candle_count INT",
+        "ALTER TABLE predictions ADD COLUMN IF NOT EXISTS data_age_seconds DOUBLE PRECISION",
+        "ALTER TABLE predictions ADD COLUMN IF NOT EXISTS data_sufficiency_issues JSONB",
+    ]:
+        try:
+            async with engine.connect() as conn:
+                await conn.execute(text(col_sql))
+                await conn.commit()
+        except Exception:
+            logger.warning("migration_data_quality_columns_failed", exc_info=True)
+
     # Initialize components
     prediction_store = PredictionStore(session_factory)
     training_data_store = TrainingDataStore(session_factory)
     ai_signal_store = AISignalStore(session_factory)
+    candle_store = CandleStore(session_factory)
     market_data = MarketDataCollector()
     broker = PocketOptionBroker(config=settings.broker)
+
+    # Wire candle persistence — new candles are buffered and flushed async
+    market_data.set_candle_store(candle_store)
+
+    # Background task: flush pending candles to Postgres every 30s
+    async def _candle_flush_loop() -> None:
+        while True:
+            try:
+                n = await market_data.flush_pending_candles()
+                if n:
+                    logger.info("candles_flushed", count=n)
+            except Exception:
+                logger.warning("candle_flush_error", exc_info=True)
+            await asyncio.sleep(30)
+
+    flush_task = asyncio.create_task(_candle_flush_loop())
 
     # Load ML model if available
     ml_model = TradingModel()
@@ -233,6 +304,8 @@ async def main() -> None:
 
     # Graceful shutdown
     logger.info("shutting_down")
+    flush_task.cancel()
+    await asyncio.gather(flush_task, return_exceptions=True)
     await ai_engine.close()
     trade_tracker.stop()
     reconnect_task.cancel()

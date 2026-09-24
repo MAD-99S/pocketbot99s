@@ -50,11 +50,13 @@ class PredictionStore:
                     INSERT INTO predictions
                         (id, telegram_id, symbol, timeframe_sec, direction,
                          confidence, reasoning, indicators, entry_price,
-                         entry_time, expiry_time, result)
+                         entry_time, expiry_time, result,
+                         candle_count, data_age_seconds, data_sufficiency_issues, feature_snapshot)
                     VALUES
                         (:id, :telegram_id, :symbol, :timeframe_sec, :direction,
                          :confidence, :reasoning, :indicators, :entry_price,
-                         :entry_time, :expiry_time, :result)
+                         :entry_time, :expiry_time, :result,
+                         :candle_count, :data_age_seconds, :data_sufficiency_issues, :feature_snapshot)
                     """
                 ),
                 {
@@ -70,6 +72,10 @@ class PredictionStore:
                     "entry_time": prediction.entry_time,
                     "expiry_time": prediction.expiry_time,
                     "result": prediction.result,
+                    "candle_count": prediction.candle_count,
+                    "data_age_seconds": prediction.data_age_seconds,
+                    "data_sufficiency_issues": _sanitize_for_json(prediction.data_sufficiency_issues),
+                    "feature_snapshot": _sanitize_for_json(prediction.feature_snapshot),
                 },
             )
             await session.commit()
@@ -252,6 +258,32 @@ class PredictionStore:
                     """
                 ),
                 {"tid": telegram_id, "limit": limit},
+            )
+            rows = result.mappings().all()
+        return [dict(row) for row in rows]
+
+
+    async def get_labeled_for_calibration(self, limit: int = 1000) -> list[dict]:
+        """Return labeled predictions (win/loss) with confidence values for
+        building the reliability curve.
+
+        Used by CalibrationStore.build_curve() to compute empirical win
+        rates per confidence bucket.  Returns rows with symbol, direction,
+        confidence, and result columns.
+        """
+        async with self._session_factory() as session:
+            result = await session.execute(
+                text(
+                    """
+                    SELECT symbol, direction, confidence, result
+                    FROM predictions
+                    WHERE result IN ('win', 'loss')
+                      AND confidence IS NOT NULL
+                    ORDER BY created_at DESC
+                    LIMIT :limit
+                    """
+                ),
+                {"limit": limit},
             )
             rows = result.mappings().all()
         return [dict(row) for row in rows]

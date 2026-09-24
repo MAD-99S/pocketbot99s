@@ -50,21 +50,29 @@ CANDLE_TIMEFRAMES: dict[str, int] = {
 CANDLES_NEEDED = 30
 
 # Minimum candles required per timeframe for signal generation.
-# Higher timeframes have fewer candles available from the server,
-# so we relax the requirement proportionally.
+# Derived from the slowest indicator's warm-up need (MACD(12,26,9) needs
+# ~35-40 bars before its slow EMA is numerically stable; ADX/ATR need
+# ~28-30 for Wilder smoothing to settle). The gate uses 40 candles as a
+# floor, driven by indicator stability — NOT shrunk per-timeframe to hit
+# an arbitrary "always respond fast" UX target.
 MIN_CANDLES_BY_TIMEFRAME: dict[int, int] = {
-    60: 16,   # 1m — server returns plenty
-    300: 10,  # 5m — server returns ~10-15 with scaled offset
-    900: 8,   # 15m — server returns very few; indicators degrade gracefully
+    60: 40,   # 1m — MACD stable at 35-40
+    300: 40,  # 5m — same indicator set, same warm-up
+    900: 40,  # 15m — accumulate real history, surface "still warming up" to user
 }
 
 
 def min_candles_for_timeframe(timeframe_sec: int) -> int:
     """Return the minimum candles needed for a given timeframe."""
-    return MIN_CANDLES_BY_TIMEFRAME.get(timeframe_sec, 10)
+    return MIN_CANDLES_BY_TIMEFRAME.get(timeframe_sec, 40)
 
 
 # --- Always-Signal Directional Confidence Strategy Constants ---
+# DEPRECATED: this fallback path forced a directional signal even when data
+# was thin, which is the opposite of what we want for prediction quality.
+# The DataSufficiencyGate (data_sufficiency_gate.py) now returns "no signal"
+# when data doesn't meet the bar. These constants are kept for reference but
+# are no longer wired into the active signal path.
 
 # Trend strength thresholds (normalized EMA cross magnitude = |ema_fast - ema_slow| / close).
 # Strong trend gets high confidence bonus, mild trend gets moderate bonus.

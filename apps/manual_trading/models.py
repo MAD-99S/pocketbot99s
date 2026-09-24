@@ -34,6 +34,11 @@ class Prediction(BaseModel):
     result: str | None = None
     result_requested_at: datetime | None = None
     created_at: datetime | None = None
+    # Data quality metadata logged with the signal (for calibration auditing)
+    candle_count: int | None = None
+    data_age_seconds: float | None = None
+    data_sufficiency_issues: list[str] | None = None
+    feature_snapshot: dict | None = None
 
 
 class Signal(BaseModel):

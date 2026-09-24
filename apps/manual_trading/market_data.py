@@ -12,8 +12,12 @@ import json
 import logging
 import time as _time
 from decimal import Decimal, InvalidOperation
+from typing import TYPE_CHECKING, Callable
 
 import pandas as pd
+
+if TYPE_CHECKING:
+    from apps.manual_trading.candle_store import CandleStore
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +37,15 @@ class _CandleBuilder:
         self._current_low: float | None = None
         self._current_close: float | None = None
         self._current_start: float = 0.0  # unix seconds
+        self._current_tick_count: int = 0  # ticks accumulated in current candle
+        # Optional callback invoked with each finalized candle batch
+        self._on_finalise = None  # callable[[list[dict]], None] | None
+        # Optional callback that pushes finalized candles to the collector's pending buffer
+        self._on_push_to_flush: callable[[list[dict]], None] | None = None
+
+    def set_on_finalise(self, callback) -> None:
+        """Register a callback invoked for each finalized candle batch."""
+        self._on_finalise = callback
 
     def add_tick(self, price: float, tick_time: float) -> None:
         """Ingest a single price tick and update the current candle."""
@@ -43,39 +56,61 @@ class _CandleBuilder:
             self._current_high = price
             self._current_low = price
             self._current_close = price
+            self._current_tick_count = 1
             return
 
         # Check if this tick belongs to a new candle window
         elapsed = tick_time - self._current_start
         if elapsed >= self.timeframe_sec:
             # Close the previous candle
-            self._finalise_candle()
-            # Start a new window
+            completed = self._finalise_candle()
+            if completed and self._on_finalise is not None:
+                self._on_finalise(completed)
+            # Start a new window with this tick
             self._current_start = tick_time
             self._current_open = price
             self._current_high = price
             self._current_low = price
             self._current_close = price
+            self._current_tick_count = 1
         else:
             # Update current candle
             self._current_high = max(self._current_high, price)  # type: ignore[operator]
             self._current_low = min(self._current_low, price)  # type: ignore[operator]
             self._current_close = price
+            self._current_tick_count += 1
 
-    def _finalise_candle(self) -> None:
+    def _finalise_candle(self) -> list[dict] | None:
+        """Finalize the current candle. Returns the candle dict, or None if none open."""
         if self._current_open is None:
-            return
-        self.candles.append({
+            return None
+        candle = {
             "timestamp": self._current_start,
             "open": self._current_open,
             "high": self._current_high,
             "low": self._current_low,
             "close": self._current_close,
             "volume": 0,
-        })
-        # Keep bounded
+            "ticks_in_candle": self._current_tick_count,
+        }
+        self.candles.append(candle)
         if len(self.candles) > _MAX_CANDLES:
             self.candles = self.candles[-_MAX_CANDLES:]
+        if self._on_push_to_flush is not None:
+            try:
+                self._on_push_to_flush([candle])
+            except Exception:
+                pass
+        return [candle]
+
+    def flush_pending(self, store: CandleStore) -> int:
+        """Persist any candles completed since the last flush to Postgres.
+
+        Must be called from an async context (the caller's event loop).
+        Returns the number of candles persisted.
+        """
+        # Drains _pending_candle_flush; called via MarketDataCollector.flush_pending_candles
+        return 0  # overridden by MarketDataCollector's wrapper
 
     def snapshot(self) -> list[dict]:
         """Return a copy of all candles including the in-progress one."""
@@ -102,8 +137,56 @@ class MarketDataCollector:
         self._latest_prices: dict[str, Decimal] = {}
         self._subscribed_symbols: set[str] = set()
         self._lock = asyncio.Lock()
-        # Diagnostic: count ticks received per symbol
+        # DIAGNOSTIC: count ticks received per symbol
         self._tick_counts: dict[str, int] = {}
+        # Optional candle persistence
+        self._candle_store: CandleStore | None = None
+        # Per-symbol buffer of recently-finalised candles awaiting async flush
+        self._pending_candle_flush: dict[str, list[dict]] = {}
+
+    def set_candle_store(self, store: CandleStore | None) -> None:
+        """Attach a CandleStore for persisting completed candles to Postgres.
+
+        Each _CandleBuilder's _on_push_to_flush callback is wired to push
+        finalized candles into _pending_candle_flush (a plain list, safe
+        for synchronous calls).  Call flush_pending_candles() from an
+        async context to drain those buffers through the store.
+        """
+        self._candle_store = store
+
+    async def get_tick_history(self, symbol: str) -> list[int]:
+        """Return per-candle tick counts for the recent window (most-recent last).
+
+        Used by DataSufficiencyGate for the liquidity check. If the builder
+        doesn't track ticks per candle yet, returns an empty list (gate
+        skips the check).
+        """
+        builder = self._builders.get(symbol)
+        if builder is None:
+            return []
+        ticks: list[int] = []
+        for c in reversed(builder.candles):
+            ticks.append(c.get("ticks_in_candle", 0))
+        return ticks
+
+    async def flush_pending_candles(self, symbol: str | None = None) -> int:
+        """Persist buffered candles to the attached CandleStore.
+
+        If *symbol* is None, flushes all symbols.  Returns the total number
+        of candles persisted.
+        """
+        if self._candle_store is None:
+            return 0
+        flushed = 0
+        targets = [symbol] if symbol else list(self._pending_candle_flush.keys())
+        for sym in targets:
+            batch = self._pending_candle_flush.pop(sym, [])
+            if not batch:
+                continue
+            timeframe = self._candle_timeframes.get(sym, 60)
+            await self._candle_store.insert_completed(sym, timeframe, batch)
+            flushed += len(batch)
+        return flushed
 
     # ------------------------------------------------------------------
     # Message handler factory
@@ -409,7 +492,14 @@ class MarketDataCollector:
 
         # Initialise / reinitialise candle builder
         async with self._lock:
-            self._builders[symbol] = _CandleBuilder(timeframe_sec)
+            builder = _CandleBuilder(timeframe_sec)
+            # Wire each new builder to push finalized candles into the pending flush buffer
+            setattr(
+                builder,
+                "_on_push_to_flush",
+                lambda batch, sym=symbol: self._pending_candle_flush.setdefault(sym, []).extend(batch),
+            )
+            self._builders[symbol] = builder
             self._candle_timeframes[symbol] = timeframe_sec
             self._tick_counts[symbol] = 0
 
