@@ -188,17 +188,19 @@ class CalibrationStore:
         )
         logger.info(
             "calibration_curve_built",
-            total_samples=total_samples,
-            usable=curve.is_usable,
-            buckets=[
-                {
-                    "label": b.label,
-                    "n": b.sample_count,
-                    "win_rate": round(b.empirical_win_rate, 3),
-                    "calibrated": round(b.calibrated_value, 3),
-                }
-                for b in buckets
-            ],
+            extra={
+                "total_samples": total_samples,
+                "usable": curve.is_usable,
+                "buckets": [
+                    {
+                        "label": b.label,
+                        "n": b.sample_count,
+                        "win_rate": round(b.empirical_win_rate, 3),
+                        "calibrated": round(b.calibrated_value, 3),
+                    }
+                    for b in buckets
+                ],
+            },
         )
         return curve
 

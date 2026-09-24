@@ -697,7 +697,7 @@ async def _handle_quick_duration(
         candle_count = len(df)
         issues_list = [i.value for i in quality_report.issues] if quality_report.issues else None
 
-        # Confidence calibration — remap raw vote-ratio through reliability curve
+        # Confidence calibration — remap raw voteratio through reliability curve
         from apps.manual_trading.confidence_calibration import (
             CalibrationStore,
             ConfidenceCalibrator,
@@ -707,7 +707,9 @@ async def _handle_quick_duration(
             calibrator = ConfidenceCalibrator(
                 await CalibrationStore(store).build_curve()
             )
-            signal.confidence = calibrator.calibrate(signal.confidence)
+            signal = signal.model_copy(
+                update={"confidence": calibrator.calibrate(signal.confidence)}
+            )
 
         prediction = Prediction(
             id=uuid4(),

@@ -89,9 +89,11 @@ class CandleStore:
             await session.commit()
         logger.debug(
             "candles_persisted",
-            symbol=symbol,
-            timeframe=timeframe_sec,
-            count=len(rows),
+            extra={
+                "symbol": symbol,
+                "timeframe": timeframe_sec,
+                "count": len(rows),
+            },
         )
         return len(rows)
 
@@ -132,8 +134,10 @@ class CandleStore:
             })
         logger.info(
             "candles_loaded_from_db",
-            symbol=str(symbol),
-            timeframe=str(timeframe_sec),
-            count=len(candles),
+            extra={
+                "symbol": str(symbol),
+                "timeframe": str(timeframe_sec),
+                "count": len(candles),
+            },
         )
         return candles

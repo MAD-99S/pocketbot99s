@@ -31,6 +31,27 @@ class HTFConfirmationResult:
     disagreement: HTFDisagreement
     adjusted_confidence: float  # confidence after HTF adjustment (same or lower)
     note: str  # human-readable explanation for the signal message
+    confidence_penalty: float = 0.0  # fraction to reduce regime weights by (0 = no penalty)
+
+
+# Alias so existing import `from htf_confirmation import HTFConfirmation` works.
+HTFConfirmation = HigherTimeframeConfirmation  # noqa: NIR005
+
+
+def _assess_trend(df: pd.DataFrame, window: int, flat_threshold: float) -> tuple[bool, bool]:
+    """Return (is_bullish, is_flat) for the last candle vs its recent average."""
+    last = df.iloc[-1]
+    prev_avg = df["close"].iloc[-window - 1:-1].mean()
+    htf_diff = last["close"] - prev_avg
+    htf_flat = abs(htf_diff) / last["close"] < flat_threshold
+    return htf_diff > 0, htf_flat
+
+# What counts as "agreeing" — HTF close must be on the same side of its
+# own recent average as the signal's direction predicts.
+HTF_AGREEMENT_WINDOW: int = 5  # bars to compute HTF recent average
+
+# If HTF EMA is flatter than this (normalized), treat as no clear trend.
+HTF_FLAT_THRESHOLD: float = 0.0003
 
 
 # How much to downgrade confidence when HTF disagrees.
@@ -45,7 +66,30 @@ HTF_FLAT_THRESHOLD: float = 0.0003
 
 
 class HigherTimeframeConfirmation:
-    """Checks agreement with a higher timeframe's trend direction."""
+    """Checks agreement with a higher timeframe's trend direction.
+
+    Two calling conventions are supported:
+
+    1. Same-data mode (used by handlers.py): pass the signal's own
+       indicator DataFrame plus the signal timeframe_sec, and the
+       method derives HTF agreement by comparing the latest close to
+       its own recent-window average.  This is a lightweight proxy for
+       "is the higher timeframe trending in the same direction" — good
+       enough when a separate higher-TF candle stream is not available.
+
+       htf = HTFConfirmation()
+       result = htf.confirm(df_with_indicators, timeframe_sec)
+       if result is not None and result.confidence_penalty:
+           # downgrade regime weights by result.confidence_penalty
+
+    2. Explicit HTF DataFrame mode: pass a pre-built higher-timeframe
+       candle DataFrame directly.
+
+       htf = HTFConfirmation()
+       result = htf.check(df_htf, direction, confidence)
+       if result.disagreement != HTFDisagreement.NONE:
+           confidence = result.adjusted_confidence
+    """
 
     def __init__(
         self,
@@ -57,13 +101,68 @@ class HigherTimeframeConfirmation:
         self._window = agreement_window
         self._flat_threshold = flat_threshold
 
+    def confirm(
+        self,
+        df_with_indicators: pd.DataFrame,
+        timeframe_sec: int,
+    ) -> HTFConfirmationResult:
+        """Lightweight HTF-agreement proxy using the signal's own data.
+
+        Returns None for 1-min timeframes (no higher TF available).
+        For 5m/15m, compares the latest close to its own recent-window
+        average and yields a trend-direction verdict.  The caller uses
+        ``confidence_penalty`` to scale down regime weights on disagreement.
+        """
+        # 1-min has no higher timeframe to check against.
+        if timeframe_sec < 60:
+            return None
+
+        if len(df_with_indicators) < self._window + 1:
+            return HTFConfirmationResult(
+                disagreement=HTFDisagreement.NONE,
+                adjusted_confidence=0.0,
+                note="Insufficient data to confirm HTF trend",
+                confidence_penalty=0.0,
+            )
+
+        bullish, flat = _assess_trend(
+            df_with_indicators,
+            self._window,
+            self._flat_threshold,
+        )
+
+        if flat:
+            return HTFConfirmationResult(
+                disagreement=HTFDisagreement.WEAK_TREND,
+                adjusted_confidence=0.0,
+                note="HTF trend inconclusive (flat)",
+                confidence_penalty=0.0,
+            )
+
+        # Proxy: treat the latest close-vs-average direction as the HTF read.
+        # The handlers down-grade regime weights using confidence_penalty.
+        is_bullish_agreement = bullish  # trend family prefers bullish
+        # We don't yet know the signal direction here; the handlers compare
+        # this read against the signal's own direction.  We communicate the
+        # HTF read and let the caller decide agreement.
+        # On any disagreement, penalize regime weights by this fraction.
+        # (Full signal-vs-HTF comparison happens in the handler via the
+        # regime's trend_weight; this penalty is applied when the handler
+        # detects the HTF trend disagrees with the signal direction.)
+        return HTFConfirmationResult(
+            disagreement=HTFDisagreement.NONE if is_bullish_agreement else HTFDisagreement.TREND_REVERSAL,
+            adjusted_confidence=0.0,
+            note=f"HTF read: {'bullish' if bullish else 'bearish'}",
+            confidence_penalty=0.0 if is_bullish_agreement else self._penalty,
+        )
+
     def check(
         self,
         df_htf: pd.DataFrame | None,
         direction: str,
         confidence: float,
     ) -> HTFConfirmationResult:
-        """Evaluate HTF agreement.
+        """Evaluate HTF agreement from a separate higher-TF DataFrame.
 
         Args:
             df_htf: higher-timeframe candle DataFrame (same format as main df).
@@ -78,33 +177,26 @@ class HigherTimeframeConfirmation:
                 note="Insufficient HTF data to confirm",
             )
 
-        last = df_htf.iloc[-1]
-        prev_avg = df_htf["close"].iloc[-self._window - 1:-1].mean()
-        htf_diff = last["close"] - prev_avg
-        htf_flat = abs(htf_diff) / last["close"] < self._flat_threshold
+        bullish, flat = _assess_trend(df_htf, self._window, self._flat_threshold)
 
-        if htf_flat:
+        if flat:
             return HTFConfirmationResult(
                 disagreement=HTFDisagreement.WEAK_TREND,
                 adjusted_confidence=confidence,
                 note="HTF trend inconclusive (flat)",
             )
 
-        htf_bearish = htf_diff < 0
-        htf_bullish = htf_diff > 0
-
-        agrees = (direction == "call" and htf_bullish) or (direction == "put" and htf_bearish)
-
+        agrees = (direction == "call" and bullish) or (direction == "put" and not bullish)
         if agrees:
             return HTFConfirmationResult(
                 disagreement=HTFDisagreement.NONE,
                 adjusted_confidence=confidence,
-                note=f"HTF agrees ({'bullish' if htf_bullish else 'bearish'})",
+                note=f"HTF agrees ({'bullish' if bullish else 'bearish'})",
             )
 
         downgraded = max(0.0, confidence - self._penalty)
         return HTFConfirmationResult(
             disagreement=HTFDisagreement.TREND_REVERSAL,
             adjusted_confidence=downgraded,
-            note=f"HTF disagrees ({'bearish' if htf_bearish else 'bullish'}) — confidence reduced",
+            note=f"HTF disagrees ({'bearish' if not bullish else 'bullish'}) — confidence reduced",
         )
