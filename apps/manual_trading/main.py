@@ -85,6 +85,39 @@ async def main() -> None:
         logger.error("db_unavailable_cannot_start")
         return
 
+    # Ensure predictions table exists (idempotent migration — fresh DB bootstrap)
+    try:
+        async with engine.connect() as conn:
+            await conn.execute(text(
+                """
+                CREATE TABLE IF NOT EXISTS predictions (
+                    id UUID PRIMARY KEY,
+                    telegram_id BIGINT NOT NULL,
+                    symbol TEXT NOT NULL,
+                    timeframe_sec INTEGER NOT NULL,
+                    direction TEXT NOT NULL,
+                    confidence DOUBLE PRECISION,
+                    reasoning TEXT,
+                    indicators JSONB NOT NULL,
+                    entry_price DOUBLE PRECISION NOT NULL,
+                    entry_time TIMESTAMPTZ NOT NULL,
+                    expiry_time TIMESTAMPTZ NOT NULL,
+                    exit_price DOUBLE PRECISION,
+                    result TEXT,
+                    result_requested_at TIMESTAMPTZ,
+                    created_at TIMESTAMPTZ,
+                    candle_count INTEGER,
+                    data_age_seconds DOUBLE PRECISION,
+                    data_sufficiency_issues JSONB,
+                    feature_snapshot JSONB
+                )
+                """
+            ))
+            await conn.commit()
+        logger.info("migration_predictions_table_applied")
+    except Exception:
+        logger.warning("migration_predictions_table_failed", exc_info=True)
+
     # Ensure result_requested_at column exists (idempotent migration)
     try:
         async with engine.connect() as conn:

@@ -1,10 +1,37 @@
-"""Technical indicator computations using pandas-ta."""
+"""Technical indicator computations — self-contained, no pandas-ta dependency."""
 from __future__ import annotations
 
 from pydantic import BaseModel, ConfigDict, Field
 import pandas as pd
 import numpy as np
-import pandas_ta as ta
+
+
+def _adx(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> pd.DataFrame:
+    """Compute ADX, +DI, -DI directly (Wilder's smoothing).
+
+    Returns a DataFrame with columns ADX_{period}, DMP_{period}, DMN_{period}
+    matching the pandas-ta column-naming convention.
+    """
+    tr1 = high - low
+    tr2 = (high - close.shift(1)).abs()
+    tr3 = (low - close.shift(1)).abs()
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+
+    p_dm = pd.concat([(high - high.shift(1)), tr2], axis=1).max(axis=1)
+    n_dm = pd.concat([(low.shift(1) - low), tr3], axis=1).max(axis=1)
+    p_dm = p_dm.where((p_dm > n_dm) & (p_dm > 0), 0.0)
+    n_dm = n_dm.where((n_dm > p_dm) & (n_dm > 0), 0.0)
+
+    atr = tr.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
+    p_di = 100 * (p_dm.ewm(alpha=1 / period, min_periods=period, adjust=False).mean() / atr.replace(0, np.nan))
+    n_di = 100 * (n_dm.ewm(alpha=1 / period, min_periods=period, adjust=False).mean() / atr.replace(0, np.nan))
+
+    dx = 100 * ((p_di - n_di).abs() / (p_di + n_di).replace(0, np.nan))
+    adx = dx.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
+
+    return pd.DataFrame(
+        {f"ADX_{period}": adx, f"DMP_{period}": p_di, f"DMN_{period}": n_di}
+    )
 
 
 class IndicatorConfig(BaseModel):
@@ -80,8 +107,9 @@ class TechnicalIndicators:
         out["return_1"] = out["close"].pct_change(periods=1)
         out["return_3"] = out["close"].pct_change(periods=3)
 
-        adx_df = ta.adx(out["high"], out["low"], out["close"], length=c.atr_period)
-        out["adx"] = adx_df.iloc[:, 0]
+        adx_df = _adx(out["high"], out["low"], out["close"], period=c.atr_period)
+        adx_col = f"ADX_{c.atr_period}"
+        out["adx"] = adx_df[adx_col]
 
         zscore_window = 20
         out["zscore"] = (

@@ -1,7 +1,7 @@
 from pathlib import Path
 from decimal import Decimal
 
-from pydantic import Field, PostgresDsn, RedisDsn, SecretStr, field_validator
+from pydantic import Field, PostgresDsn, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -12,14 +12,6 @@ class PostgresConfig(BaseSettings):
     pool_min: int = 5
     pool_max: int = 20
     connect_timeout: int = 30
-
-
-class RedisConfig(BaseSettings):
-    model_config = SettingsConfigDict(env_prefix="REDIS_", env_file=".env", extra="ignore")
-
-    url: RedisDsn = "redis://localhost:6379/0"
-    max_connections: int = 10
-    cache_ttl: int = 300
 
 
 class BrokerConfig(BaseSettings):
@@ -119,7 +111,6 @@ class AppConfig(BaseSettings):
     duckdb_path: Path = Path("storage/analytics.duckdb")
 
     postgres: PostgresConfig = PostgresConfig()
-    redis: RedisConfig = RedisConfig()
     broker: BrokerConfig = BrokerConfig()
     telegram: TelegramConfig = TelegramConfig()
     trading: TradingConfig = TradingConfig()
