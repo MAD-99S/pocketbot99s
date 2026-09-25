@@ -789,11 +789,24 @@ async def _wait_for_candles(
     while asyncio.get_event_loop().time() < deadline:
         df = await collector.get_candles(symbol)
         if df is not None and len(df) >= min_needed:
-            logger.info(
-                "candles_ready symbol=%s count=%d attempts=%d",
-                symbol, len(df), attempts,
-            )
-            return df
+            # Check staleness of the most recent candle — the slow
+            # ``loadHistoryPeriod`` batch is often minutes old, which trips
+            # the sufficiency gate's stale_data check. Keep polling until
+            # we have fresh candles (last candle within 2× timeframe of now).
+            if len(df) > 0:
+                raw_ts = df["timestamp"].iloc[-1]
+                if hasattr(raw_ts, "tzinfo"):
+                    last_ts = pd.Timestamp(raw_ts)
+                else:
+                    last_ts = pd.to_datetime(raw_ts, unit="s", utc=True)
+                now_ts = pd.Timestamp.now(timezone.utc)
+                age_sec = (now_ts - last_ts).total_seconds()
+                if age_sec <= timeframe_sec * 2.0:
+                    logger.info(
+                        "candles_ready symbol=%s count=%d attempts=%d age=%.0fs",
+                        symbol, len(df), attempts, age_sec,
+                    )
+                    return df
         attempts += 1
         await asyncio.sleep(CANDLE_POLL_INTERVAL)
 
