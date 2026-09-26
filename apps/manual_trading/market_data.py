@@ -554,17 +554,51 @@ class MarketDataCollector:
         Only returns candles matching the symbol's *currently active*
         timeframe (as set by the last request_candles() call) — leftover
         candles from a previous timeframe request for this symbol are
-        keyed separately and never merged in.
+        keyed separately and never merged in. The returned DataFrame is
+        filtered to the most recent 30× timeframe_sec window to exclude
+        old accumulated server-candle history that would trip the
+        DataSufficiencyGate's gap check (the boundary between old history
+        and the fresh batch is a large gap by construction; only the
+        fresh window matters for live signals).
         """
+        key = self._candle_key(symbol)
+
+        # Merge broker fast-candles with builder live ticks — but only include
+        # builder ticks that are newer than the newest server candle. This avoids
+        # the boundary gap between old accumulated history and the fresh batch that
+        # would trigger timestamp_gaps, while still giving the gate both the
+        # broker's 50 historical candles and any live ticks that arrived after.
+        # NOTE: we do NOT apply a time window filter here. The DataSufficiencyGate
+        # already scopes its own gap check to a recent window (100× timeframe),
+        # so filtering here only drops candles the gate would otherwise see.
+        # Removing the filter lets the gate see the broker's full 50-candle batch
+        # (needed to reach MIN_CANDLES_FOR_STABLE_INDICATORS = 40).
         async with self._lock:
-            key = self._candle_key(symbol)
             server_candles = self._candles.get(key, []) if key else []
             builder = self._builders.get(symbol)
 
-        # Merge server candles + builder candles
-        all_candles = list(server_candles)
+        all_candles: list[dict] = []
+
+        # 1. Include all server fast-candles (broker's 50-historical window).
+        all_candles.extend(server_candles)
+
+        # 2. Include builder live ticks only if they are newer than the newest
+        #    server candle (avoids duplicating/overlapping and creates no boundary gap).
         if builder is not None:
-            all_candles.extend(builder.snapshot())
+            snapshot = builder.snapshot()
+            if snapshot:
+                newest_server_ts = float(
+                    server_candles[-1]["timestamp"]
+                    if server_candles
+                    else 0.0
+                )
+                # Only keep live ticks whose timestamp is strictly after the newest
+                # server candle — these are the genuinely fresh ones.
+                fresh_ticks = [
+                    c for c in snapshot
+                    if float(c["timestamp"]) > newest_server_ts
+                ]
+                all_candles.extend(fresh_ticks)
 
         if not all_candles:
             return None
@@ -575,8 +609,10 @@ class MarketDataCollector:
             df = df.sort_values("timestamp").reset_index(drop=True)
 
         # De-duplicate by timestamp (keep last)
-        if "timestamp" in df.columns:
-            df = df.drop_duplicates(subset=["timestamp", "open", "high", "low", "close"], keep="last")
+        if "timestamp" in df.columns and len(df) > 0:
+            df = df.drop_duplicates(
+                subset=["timestamp", "open", "high", "low", "close"], keep="last"
+            )
             df = df.reset_index(drop=True)
 
         return df

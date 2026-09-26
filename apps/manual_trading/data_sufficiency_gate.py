@@ -147,10 +147,33 @@ class DataSufficiencyGate:
             issues.append(DataQualityIssue.STALE_DATA)
 
         # --- Gaps: any missing candles in the recent window? ---
-        if candle_count >= 3:
-            deltas = df["timestamp"].diff().dt.total_seconds().dropna()
+        # OTC pair history naturally has irregular spacing (market closures,
+        # weekend gaps, low-liquidity periods). Only the most recent candles
+        # need to be gap-free — old historical gaps don't affect live signals.
+        # The merged DataFrame (old accumulated server_candles + new fast batch)
+        # has a large boundary gap between the two sources; filter it out by
+        # keeping only candles within a generous time band of the newest candle.
+        if len(df) >= self._min_candles:
+            newest_ts = pd.Timestamp(df["timestamp"].iloc[-1])
+            if newest_ts.tzinfo is None:
+                newest_ts = newest_ts.tz_localize("UTC")
+            if now.tzinfo is None:
+                now = now.tz_localize("UTC")
+            # generous window: 90 min for 60s candles, wider for longer TFs
+            lookback = timeframe_sec * 100
+            cutoff = pd.Timestamp(newest_ts.timestamp() - lookback, tz="UTC")
+            recent_df = df[df["timestamp"] >= cutoff]
+            # fallback to tail(min_candles) if window is too small
+            if len(recent_df) < self._min_candles:
+                recent_df = df.tail(self._min_candles)
+            gap_df = recent_df
+        else:
+            gap_df = df.tail(self._min_candles)
+        if len(gap_df) >= 3:
+            deltas = gap_df["timestamp"].diff().dt.total_seconds().dropna()
             max_gap = float(deltas.max()) if not deltas.empty else 0.0
             detail["max_gap_sec"] = round(max_gap, 1)
+            detail["gap_window"] = f"{len(gap_df)} candles (lookback={lookback}s)"
             if max_gap > timeframe_sec * self._max_gap_multiple:
                 issues.append(DataQualityIssue.TIMESTAMP_GAPS)
 
