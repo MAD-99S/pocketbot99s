@@ -131,7 +131,13 @@ class MarketDataCollector:
     """Captures price ticks from broker messages and builds candles."""
 
     def __init__(self) -> None:
-        self._candles: dict[str, list[dict]] = {}
+        # Keyed by (symbol, timeframe_sec), NOT symbol alone — a symbol can be
+        # requested at different timeframes across a session, and candles from
+        # one timeframe must never be merged with another's (different spacing
+        # trips the DataSufficiencyGate's gap check even with plenty of raw
+        # candles). Builders stay symbol-keyed since request_candles() already
+        # replaces the whole builder on every timeframe switch.
+        self._candles: dict[tuple[str, int], list[dict]] = {}
         self._builders: dict[str, _CandleBuilder] = {}
         self._candle_timeframes: dict[str, int] = {}
         self._latest_prices: dict[str, Decimal] = {}
@@ -153,6 +159,20 @@ class MarketDataCollector:
         async context to drain those buffers through the store.
         """
         self._candle_store = store
+
+    def _candle_key(self, symbol: str, timeframe_sec: int | None = None) -> tuple[str, int] | None:
+        """Build the (symbol, timeframe) key for `_candles`.
+
+        Falls back to the symbol's currently-active timeframe (set by
+        request_candles()) when timeframe_sec isn't given explicitly.
+        Returns None if no active timeframe is known for this symbol yet
+        (caller should skip storing rather than guess).
+        """
+        if timeframe_sec is None:
+            timeframe_sec = self._candle_timeframes.get(symbol)
+        if timeframe_sec is None:
+            return None
+        return (symbol, timeframe_sec)
 
     async def get_tick_history(self, symbol: str) -> list[int]:
         """Return per-candle tick counts for the recent window (most-recent last).
@@ -313,18 +333,25 @@ class MarketDataCollector:
 
             if parsed:
                 async with self._lock:
-                    if asset not in self._candles:
-                        self._candles[asset] = []
-                    self._candles[asset].extend(parsed)
-                    self._candles[asset] = self._candles[asset][-_MAX_CANDLES:]
+                    key = self._candle_key(asset)
+                    if key is None:
+                        logger.debug(
+                            "candle_history_no_active_timeframe symbol=%s", asset
+                        )
+                        return
+                    if key not in self._candles:
+                        self._candles[key] = []
+                    self._candles[key].extend(parsed)
+                    self._candles[key] = self._candles[key][-_MAX_CANDLES:]
+                    total = len(self._candles[key])
 
                 # Extract latest price
                 last = parsed[-1]
                 self._latest_prices[asset] = Decimal(str(last["close"]))
 
                 logger.warning(
-                    "candles_received_from_server symbol=%s count=%d total=%d",
-                    asset, len(parsed), len(self._candles.get(asset, [])),
+                    "candles_received_from_server symbol=%s timeframe=%d count=%d total=%d",
+                    asset, key[1], len(parsed), total,
                 )
         except (ValueError, TypeError, InvalidOperation):
             logger.debug("candle_parse_error", exc_info=True)
@@ -367,17 +394,24 @@ class MarketDataCollector:
 
             if parsed:
                 async with self._lock:
-                    if asset not in self._candles:
-                        self._candles[asset] = []
-                    self._candles[asset].extend(parsed)
-                    self._candles[asset] = self._candles[asset][-_MAX_CANDLES:]
+                    key = self._candle_key(asset)
+                    if key is None:
+                        logger.debug(
+                            "stream_update_no_active_timeframe symbol=%s", asset
+                        )
+                        return
+                    if key not in self._candles:
+                        self._candles[key] = []
+                    self._candles[key].extend(parsed)
+                    self._candles[key] = self._candles[key][-_MAX_CANDLES:]
+                    total = len(self._candles[key])
 
                 last = parsed[-1]
                 self._latest_prices[asset] = Decimal(str(last["close"]))
 
                 logger.warning(
-                    "candles_from_stream symbol=%s count=%d total=%d",
-                    asset, len(parsed), len(self._candles.get(asset, [])),
+                    "candles_from_stream symbol=%s timeframe=%d count=%d total=%d",
+                    asset, key[1], len(parsed), total,
                 )
                 return
 
@@ -447,22 +481,26 @@ class MarketDataCollector:
 
         if parsed:
             async with self._lock:
-                if asset not in self._candles:
-                    self._candles[asset] = []
-                self._candles[asset].extend(parsed)
-                self._candles[asset] = self._candles[asset][-_MAX_CANDLES:]
+                key = self._candle_key(asset)
+                if key is None:
+                    logger.debug("chart_ingest_no_active_timeframe symbol=%s", asset)
+                    return
+                if key not in self._candles:
+                    self._candles[key] = []
+                self._candles[key].extend(parsed)
+                self._candles[key] = self._candles[key][-_MAX_CANDLES:]
+                total = len(self._candles[key])
 
             # Also extract latest price
-            if parsed:
-                last = parsed[-1]
-                try:
-                    self._latest_prices[asset] = Decimal(str(last["close"]))
-                except (InvalidOperation, TypeError):
-                    pass
+            last = parsed[-1]
+            try:
+                self._latest_prices[asset] = Decimal(str(last["close"]))
+            except (InvalidOperation, TypeError):
+                pass
 
             logger.warning(
-                "candles_ingested_from_charts symbol=%s count=%d total=%d",
-                asset, len(parsed), len(self._candles.get(asset, [])),
+                "candles_ingested_from_charts symbol=%s timeframe=%d count=%d total=%d",
+                asset, key[1], len(parsed), total,
             )
 
     # ------------------------------------------------------------------
@@ -511,10 +549,16 @@ class MarketDataCollector:
         )
 
     async def get_candles(self, symbol: str) -> pd.DataFrame | None:
-        """Get accumulated candles for a symbol as a DataFrame."""
+        """Get accumulated candles for a symbol as a DataFrame.
+
+        Only returns candles matching the symbol's *currently active*
+        timeframe (as set by the last request_candles() call) — leftover
+        candles from a previous timeframe request for this symbol are
+        keyed separately and never merged in.
+        """
         async with self._lock:
-            # Prefer server-provided candles if available
-            server_candles = self._candles.get(symbol, [])
+            key = self._candle_key(symbol)
+            server_candles = self._candles.get(key, []) if key else []
             builder = self._builders.get(symbol)
 
         # Merge server candles + builder candles
