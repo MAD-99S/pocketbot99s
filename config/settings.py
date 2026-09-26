@@ -23,26 +23,20 @@ class BrokerConfig(BaseSettings):
     max_subscriptions: int = 4
     connection_timeout: int = 30
     reconnect_delay: int = 5
+    max_subscriptions: int = 4
+    connection_timeout: int = 30
+    reconnect_delay: int = 5
 
 
 class TelegramConfig(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="TELEGRAM_", env_file=".env", extra="ignore")
 
-    bot_token: SecretStr = SecretStr("")
-    allowed_user_ids: list[int] = Field(default_factory=list)
-    admin_user_ids: list[int] = Field(default_factory=list)
-    polling: bool = True
-    webhook_url: str | None = None
-    webhook_port: int = 8443
-    rate_limit_global: int = 30
-    rate_limit_per_user: int = 10
-    max_subscriptions_per_user: int = 5
+    bot_token: SecretStr = Field(default="")
+    admin_ids: list[int] = Field(default_factory=list)
 
-    @field_validator("allowed_user_ids", "admin_user_ids", mode="before")
+    @field_validator("admin_ids", mode="before")
     @classmethod
-    def _parse_comma_list(cls, v: str | int | list[int]) -> list[int]:
-        if isinstance(v, int):
-            return [v]
+    def parse_admin_ids(cls, v):
         if isinstance(v, str):
             return [int(x.strip()) for x in v.split(",") if x.strip()]
         return v
@@ -69,14 +63,6 @@ class SignalConfig(BaseSettings):
     min_confidence: float = 0.6
     min_wins_to_activate: int = 10
     max_features: int = 50
-
-
-class OpenRouterConfig(BaseSettings):
-    model_config = SettingsConfigDict(env_prefix="OPENROUTER_", env_file=".env", extra="ignore")
-
-    api_key: str = ""
-    request_timeout: float = 15.0
-    max_retries: int = 3
 
 
 class MLflowConfig(BaseSettings):
@@ -116,7 +102,6 @@ class AppConfig(BaseSettings):
     trading: TradingConfig = TradingConfig()
     signal: SignalConfig = SignalConfig()
     mlflow: MLflowConfig = MLflowConfig()
-    openrouter: OpenRouterConfig = OpenRouterConfig()
     logging: LoggingConfig = LoggingConfig()
 
 

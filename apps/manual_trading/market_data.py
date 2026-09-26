@@ -335,14 +335,31 @@ class MarketDataCollector:
                 async with self._lock:
                     key = self._candle_key(asset)
                     if key is None:
-                        logger.debug(
+                        logger.warning(
                             "candle_history_no_active_timeframe symbol=%s", asset
                         )
                         return
-                    if key not in self._candles:
-                        self._candles[key] = []
-                    self._candles[key].extend(parsed)
-                    self._candles[key] = self._candles[key][-_MAX_CANDLES:]
+                    # Distinguish loadHistoryPeriodFast (self-consistent fresh batch)
+                    # from loadHistoryPeriod (accumulates) — fast batches always
+                    # include an "index" field; regular history doesn't.
+                    is_fast = isinstance(event_data, dict) and "index" in event_data
+                    if is_fast:
+                        # loadHistoryPeriodFast delivers a self-consistent fresh
+                        # batch — replace stored candles instead of extending.
+                        # Extending creates a boundary gap between old accumulated
+                        # history and the fresh batch, which trips the gate's
+                        # timestamp_gaps check even with plenty of candles.
+                        self._candles[key] = parsed
+                        logger.warning(
+                            "candles_replace_from_server symbol=%s timeframe=%d count=%d "
+                            "reason=loadHistoryPeriodFast_replace",
+                            asset, key[1], len(parsed),
+                        )
+                    else:
+                        if key not in self._candles:
+                            self._candles[key] = []
+                        self._candles[key].extend(parsed)
+                        self._candles[key] = self._candles[key][-_MAX_CANDLES:]
                     total = len(self._candles[key])
 
                 # Extract latest price

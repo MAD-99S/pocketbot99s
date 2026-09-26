@@ -51,12 +51,14 @@ class PredictionStore:
                         (id, telegram_id, symbol, timeframe_sec, direction,
                          confidence, reasoning, indicators, entry_price,
                          entry_time, expiry_time, result,
-                         candle_count, data_age_seconds, data_sufficiency_issues, feature_snapshot)
+                         candle_count, data_age_seconds, data_sufficiency_issues,
+                         feature_snapshot, status)
                     VALUES
                         (:id, :telegram_id, :symbol, :timeframe_sec, :direction,
                          :confidence, :reasoning, :indicators, :entry_price,
                          :entry_time, :expiry_time, :result,
-                         :candle_count, :data_age_seconds, :data_sufficiency_issues, :feature_snapshot)
+                         :candle_count, :data_age_seconds, :data_sufficiency_issues,
+                         :feature_snapshot, :status)
                     """
                 ),
                 {
@@ -76,6 +78,7 @@ class PredictionStore:
                     "data_age_seconds": prediction.data_age_seconds,
                     "data_sufficiency_issues": _sanitize_for_json(prediction.data_sufficiency_issues),
                     "feature_snapshot": _sanitize_for_json(prediction.feature_snapshot),
+                    "status": prediction.status,
                 },
             )
             await session.commit()

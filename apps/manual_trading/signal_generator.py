@@ -49,6 +49,13 @@ logger = logging.getLogger(__name__)
 # this is a floor — not timeframe-shrunk.
 MIN_CANDLES = 40
 
+# Confidence floor (Phase 1B, UPGRADE_PLAN §6.B): below this threshold,
+# return has_signal=False even if indicators reached a majority vote.
+# Set at 0.95 — directly data-supported: 0.95+ wins ~73%, below 0.95 wins ~41%
+# (28 predictions, 2026-09-26). Below-floor signals return has_signal=False
+# with reasoning kept for the self-training calibration job (UPGRADE_PLAN §7).
+CONFIDENCE_FLOOR = 0.95
+
 
 def generate_signal(
     df_with_indicators: pd.DataFrame,
@@ -266,6 +273,11 @@ def generate_signal(
             has_signal=False,
         )
 
+    # Confidence floor (Phase 1B): below this threshold, return no-signal
+    # even if indicators reached a majority. Set at 0.95 — directly
+    # data-supported (see module-level CONFIDENCE_FLOOR comment). Uses the
+    # module-level constant, not a local shadow.
+
     if call_weight > put_weight:
         direction = "call"
         confidence = call_weight / total_weight
@@ -279,11 +291,20 @@ def generate_signal(
     # Clamp confidence to [0.55, 0.95]
     confidence = max(0.55, min(0.95, confidence))
 
+    if confidence < CONFIDENCE_FLOOR:
+        reasoning.append(f"Confidence {confidence:.0%} below floor {CONFIDENCE_FLOOR:.0%} — suppressing signal")
+        return Signal(
+            direction=direction,
+            confidence=round(confidence, 2),
+            reasoning=reasoning,
+            indicators=_clean_nan(indicator_snapshot),
+            has_signal=False,
+        )
+
     # Add summary bullet
     summary = f"Bullish consensus from {len(votes)} indicators" if direction == "call" else f"Bearish consensus from {len(votes)} indicators"
     reasoning.insert(0, summary)
     reasoning.insert(1, f"Regime: {regime.summary()}")
-
     return Signal(
         direction=direction,
         confidence=round(confidence, 2),

@@ -39,6 +39,8 @@ class Prediction(BaseModel):
     data_age_seconds: float | None = None
     data_sufficiency_issues: list[str] | None = None
     feature_snapshot: dict | None = None
+    # Pipeline status: delivered | no_signal_data | no_signal_confidence | no_signal_other
+    status: str | None = None
 
 
 class Signal(BaseModel):
