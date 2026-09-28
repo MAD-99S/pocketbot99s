@@ -64,18 +64,25 @@ def format_no_signal(symbol: str, reason: str) -> str:
     )
 
 
-def format_prediction_confirmed(prediction: Prediction) -> str:
-    """Format confirmation after a prediction is saved."""
+def format_prediction_confirmed(prediction: Prediction, display_confidence: float | None = None) -> str:
+    """Format confirmation after a prediction is saved.
+
+    `display_confidence` is the calibrated confidence shown to the user.
+    When None, falls back to the stored raw confidence.
+    """
     symbol_display = prediction.symbol.replace("_otc", " (OTC)").replace("_", "/")
     direction_emoji = "CALL" if prediction.direction == "call" else "PUT"
     duration_label = _duration_label(prediction.timeframe_sec)
+    conf = display_confidence if display_confidence is not None else prediction.confidence
+    conf_pct = f"{conf:.0%}" if conf is not None else "N/A"
 
     return (
         f"\u23f0 Prediction Recorded\n\n"
         f"{direction_emoji} {symbol_display}\n"
         f"Entry: {float(prediction.entry_price):.5f}\n"
         f"Duration: {duration_label}\n"
-        f"Expires: {prediction.expiry_time.strftime('%H:%M:%S UTC')}\n\n"
+        f"Expires: {prediction.expiry_time.strftime('%H:%M:%S UTC')}\n"
+        f"Confidence: {conf_pct}\n\n"
         f"Tracking price movement..."
     )
 

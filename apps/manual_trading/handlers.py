@@ -43,7 +43,6 @@ from apps.manual_trading.messages import (
 from apps.manual_trading.models import Prediction
 from apps.manual_trading.signal_generator import generate_signal
 from apps.manual_trading.strategies.mean_reversion import MeanReversionEngine
-from apps.manual_trading.constants import COOLDOWN_BARS
 from apps.manual_trading.data_sufficiency_gate import DataSufficiencyGate
 from infrastructure.features.indicators.technical import TechnicalIndicators
 from apps.manual_trading.confidence_calibration import (
@@ -306,8 +305,8 @@ async def _handle_quick_duration(
             symbol_display = symbol.replace("_otc", " (OTC)").replace("_", "/")
             issue_str = quality_report.summary()
             logger.warning(
-                "data_sufficiency_failed symbol=%s report=%s",
-                symbol, issue_str,
+                "signal_rejected_data_sufficiency symbol=%s telegram_id=%d report=%s",
+                symbol, telegram_id, issue_str,
             )
             await query.edit_message_text(
                 f"Not enough reliable data yet for {symbol_display}.\n"
@@ -343,24 +342,6 @@ async def _handle_quick_duration(
                 if htf_result.note:
                     htf_note = htf_result.note
 
-        # Cooldown check — block signals for the same pair within COOLDOWN_BARS
-        cooldown_state: dict[str, int] = context.user_data.setdefault(
-            "signal_cooldown", {}
-        )
-        current_bar = len(df_with_indicators) - 1
-        last_bar = cooldown_state.get(symbol)
-        if last_bar is not None and (current_bar - last_bar) < COOLDOWN_BARS:
-            remaining = COOLDOWN_BARS - (current_bar - last_bar)
-            symbol_display = symbol.replace("_otc", " (OTC)").replace("_", "/")
-            await query.edit_message_text(
-                format_no_signal(
-                    symbol_display,
-                    f"Cooldown — wait {remaining} more bar{'s' if remaining != 1 else ''} "
-                    f"before next signal for this pair",
-                )
-            )
-            return
-
         # Generate signal — mean-reversion engine for 5-min OTC pairs
         is_otc_5min = symbol.endswith("_otc") and timeframe_sec == 300
         if is_otc_5min:
@@ -372,8 +353,13 @@ async def _handle_quick_duration(
         # Gate: only proceed if signal is valid
         if not signal.has_signal:
             symbol_display = symbol.replace("_otc", " (OTC)").replace("_", "/")
+            reason = signal.reasoning[0] if signal.reasoning else "No clear signal"
+            logger.warning(
+                "signal_rejected_floor symbol=%s telegram_id=%d reason=%s confidence=%.2f",
+                symbol, telegram_id, reason, signal.confidence,
+            )
             await query.edit_message_text(
-                format_no_signal(symbol_display, signal.reasoning[0])
+                format_no_signal(symbol_display, reason)
             )
             return
 
@@ -417,27 +403,18 @@ async def _handle_quick_duration(
         candle_count = len(df)
         issues_list = [i.value for i in quality_report.issues] if quality_report.issues else None
 
-        # Confidence calibration — remap raw voteratio through reliability curve
-        from apps.manual_trading.confidence_calibration import (
-            CalibrationStore,
-            ConfidenceCalibrator,
-        )
-        store: PredictionStore = context.bot_data["prediction_store"]
-        if signal.has_signal:
-            calibrator = ConfidenceCalibrator(
-                await CalibrationStore(store).build_curve()
-            )
-            signal = signal.model_copy(
-                update={"confidence": calibrator.calibrate(signal.confidence)}
-            )
-
+        # Store prediction with RAW confidence (floor-checked, pre-calibration).
+        # Calibration is applied at DISPLAY time only, so the DB stores raw
+        # vote ratios — the reliability curve is then built from raw values
+        # instead of from already-calibrated values (which caused the death
+        # spiral where 0.95 raw → 0.71 stored → curve maps 0.71 → 0.231).
         prediction = Prediction(
             id=uuid4(),
             telegram_id=telegram_id,
             symbol=symbol,
             timeframe_sec=timeframe_sec,
             direction=signal.direction,
-            confidence=signal.confidence,
+            confidence=signal.confidence,  # RAW — floor-checked, pre-calibration
             reasoning="\n".join(signal.reasoning),
             indicators=signal.indicators,
             entry_price=Decimal(str(entry_price_float)),
@@ -447,17 +424,31 @@ async def _handle_quick_duration(
             candle_count=candle_count,
             data_age_seconds=data_age,
             data_sufficiency_issues=issues_list,
-            feature_snapshot=signal.indicators,
+            feature_snapshot={**signal.indicators, "regime": regime.regime.value},
+            created_at=now,  # set explicitly — DB insert does not default it
+            status="delivered",
         )
 
+        # Calibration for DISPLAY only — compute the calibrated confidence
+        # that the user sees, without overwriting the stored raw value.
         store: PredictionStore = context.bot_data["prediction_store"]
+        display_confidence = signal.confidence
+        if signal.has_signal:
+            from apps.manual_trading.confidence_calibration import (
+                CalibrationStore,
+                ConfidenceCalibrator,
+            )
+            calibrator = ConfidenceCalibrator(
+                await CalibrationStore(store).build_curve()
+            )
+            display_confidence = calibrator.calibrate(
+                signal.confidence, regime=regime.regime.value
+            )
+
         await store.insert(prediction)
 
-        # Update cooldown state — prevent rapid re-signals for same pair
-        cooldown_state[symbol] = current_bar
-
-        # Send confirmation
-        confirmation = format_prediction_confirmed(prediction)
+        # Send confirmation (with calibrated confidence in the caption)
+        confirmation = format_prediction_confirmed(prediction, display_confidence)
         await context.bot.send_message(chat_id=telegram_id, text=confirmation)
 
     except Exception:

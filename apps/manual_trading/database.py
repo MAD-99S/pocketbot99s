@@ -52,13 +52,13 @@ class PredictionStore:
                          confidence, reasoning, indicators, entry_price,
                          entry_time, expiry_time, result,
                          candle_count, data_age_seconds, data_sufficiency_issues,
-                         feature_snapshot, status)
+                         feature_snapshot, status, created_at)
                     VALUES
                         (:id, :telegram_id, :symbol, :timeframe_sec, :direction,
                          :confidence, :reasoning, :indicators, :entry_price,
                          :entry_time, :expiry_time, :result,
                          :candle_count, :data_age_seconds, :data_sufficiency_issues,
-                         :feature_snapshot, :status)
+                         :feature_snapshot, :status, :created_at)
                     """
                 ),
                 {
@@ -79,6 +79,7 @@ class PredictionStore:
                     "data_sufficiency_issues": _sanitize_for_json(prediction.data_sufficiency_issues),
                     "feature_snapshot": _sanitize_for_json(prediction.feature_snapshot),
                     "status": prediction.status,
+                    "created_at": prediction.created_at,
                 },
             )
             await session.commit()
@@ -267,18 +268,17 @@ class PredictionStore:
 
 
     async def get_labeled_for_calibration(self, limit: int = 1000) -> list[dict]:
-        """Return labeled predictions (win/loss) with confidence values for
-        building the reliability curve.
+        """Return labeled predictions (win/loss) with confidence and feature_snapshot.
 
-        Used by CalibrationStore.build_curve() to compute empirical win
-        rates per confidence bucket.  Returns rows with symbol, direction,
-        confidence, and result columns.
+        Used by CalibrationStore.build_curve() to build regime-aware reliability
+        curves.  Returns symbol, direction, confidence, result, and
+        feature_snapshot (which contains the regime label under the "regime" key).
         """
         async with self._session_factory() as session:
             result = await session.execute(
                 text(
                     """
-                    SELECT symbol, direction, confidence, result
+                    SELECT symbol, direction, confidence, result, feature_snapshot
                     FROM predictions
                     WHERE result IN ('win', 'loss')
                       AND confidence IS NOT NULL

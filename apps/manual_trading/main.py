@@ -30,6 +30,7 @@ from apps.manual_trading.database import PredictionStore, TrainingDataStore
 from apps.manual_trading.market_data import MarketDataCollector
 from apps.manual_trading.candle_store import CandleStore
 from apps.manual_trading.trade_tracker import TradeTracker
+from apps.manual_trading.confidence_calibration import CalibrationStore as CalibStore
 from infrastructure.ml.model import TradingModel
 
 logger = structlog.get_logger()
@@ -129,7 +130,16 @@ async def main() -> None:
     except Exception:
         logger.warning("migration_result_requested_at_failed", exc_info=True)
 
-    # Ensure training_data table exists (idempotent migration)
+    # Ensure predictions table has regime column (for regime-aware calibration)
+    try:
+        async with engine.connect() as conn:
+            await conn.execute(text(
+                "ALTER TABLE predictions ADD COLUMN IF NOT EXISTS regime TEXT"
+            ))
+            await conn.commit()
+        logger.info("migration_regime_column_applied")
+    except Exception:
+        logger.warning("migration_regime_column_failed", exc_info=True)
     try:
         async with engine.connect() as conn:
             await conn.execute(text(
@@ -275,6 +285,21 @@ async def main() -> None:
         market_data=market_data,
     )
 
+    # Rebuild the confidence calibration curve once DB is available and
+    # before the bot starts serving requests — this seeds the regime-aware
+    # reliability curve from existing labeled predictions.
+    try:
+        calib_store = CalibStore(prediction_store)
+        curve = await calib_store.build_curve()
+        logger.info(
+            "calibration_curve_rebuilt_at_startup",
+            usable=curve.is_usable,
+            total=sum(b.sample_count for b in curve.global_buckets),
+            regimes=list(curve.regime_buckets.keys()),
+        )
+    except Exception:
+        logger.warning("calibration_curve_startup_rebuild_failed", exc_info=True)
+
     # Start the Telegram bot
     logger.info("starting_telegram_bot")
     await app.initialize()
@@ -285,6 +310,26 @@ async def main() -> None:
     # Start background tasks
     trade_tracker.start()
     reconnect_task = asyncio.create_task(broker_reconnect_loop(broker))
+
+    # Periodic calibration curve rebuild — re-reads labeled predictions from
+    # the DB and rebuilds the regime-aware reliability curve so the bot
+    # continuously adapts to market shifts as new outcomes arrive.
+    async def _calibration_rebuild_loop() -> None:
+        while True:
+            await asyncio.sleep(300)  # every 5 minutes
+            try:
+                calib_store = CalibStore(prediction_store)
+                curve = await calib_store.build_curve()
+                logger.info(
+                    "calibration_curve_rebuilt",
+                    usable=curve.is_usable,
+                    total=sum(b.sample_count for b in curve.global_buckets),
+                    regimes=list(curve.regime_buckets.keys()),
+                )
+            except Exception:
+                logger.warning("calibration_curve_rebuild_failed", exc_info=True)
+
+    calib_task = asyncio.create_task(_calibration_rebuild_loop())
 
     logger.info("manual_trading_bot_started")
 
@@ -307,7 +352,8 @@ async def main() -> None:
     # Graceful shutdown
     logger.info("shutting_down")
     flush_task.cancel()
-    await asyncio.gather(flush_task, return_exceptions=True)
+    calib_task.cancel()
+    await asyncio.gather(flush_task, calib_task, return_exceptions=True)
     trade_tracker.stop()
     reconnect_task.cancel()
     await asyncio.gather(reconnect_task, return_exceptions=True)

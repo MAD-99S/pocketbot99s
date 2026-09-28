@@ -189,6 +189,21 @@ class MarketDataCollector:
             ticks.append(c.get("ticks_in_candle", 0))
         return ticks
 
+    def get_last_candle_ts(self, symbol: str, timeframe_sec: int) -> float | None:
+        """Return the timestamp of the last candle for (symbol, timeframe_sec).
+
+        Used by cooldown tracking to measure real time between signals, not
+        DataFrame row count (which is constant under loadHistoryPeriodFast
+        replace-on-fresh-batch semantics).
+        """
+        key = self._candle_key(symbol, timeframe_sec)
+        if key is None:
+            return None
+        candles = self._candles.get(key)
+        if not candles:
+            return None
+        return float(candles[-1]["timestamp"])
+
     async def flush_pending_candles(self, symbol: str | None = None) -> int:
         """Persist buffered candles to the attached CandleStore.
 

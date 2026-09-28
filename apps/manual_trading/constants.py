@@ -88,9 +88,6 @@ RSI_FAVORABLE_HIGH: float = 65.0
 ATR_SPIKE_MULTIPLIER: float = 2.0
 ATR_SMA_WINDOW: int = 10  # longest feasible with 16-30 candles
 
-# Cooldown: minimum bars between signals for the same pair (handler-layer).
-COOLDOWN_BARS: int = 3
-
 # Payout percentage filter for asset selection.
 # Only assets with payout in [MIN_ASSET_PAYOUT_PCT, MAX_ASSET_PAYOUT_PCT] are shown.
 MIN_ASSET_PAYOUT_PCT: float = 80.0
