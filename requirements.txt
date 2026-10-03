@@ -29,7 +29,7 @@ duckdb>=0.10,<2.0
 mlflow>=2.0,<4.0
 
 # Backtesting / TA
-pandas-ta>=0.3.14b0
+pandas-ta==0.3.14b0
 vectorbt>=0.26,<2.0
 
 # Dev / Test
