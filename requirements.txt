@@ -1,3 +1,7 @@
 fastapi
 uvicorn
-[STRIPPED 95 bytes]
+python-dotenv
+requests
+pandas
+numpy<2
+[STRIPPED 80 bytes]
